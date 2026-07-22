@@ -52,7 +52,7 @@ NETWORK_ID = "159020"                    # Forward network ID
 SNAPSHOT_ID = None
 
 # --- Where the checks go -------------------------------------------------------
-DIRECTORY = "rt-test"                     # intent-check directory (single level, under root)
+DIRECTORY = "rt-test"                     # intent-check directory; nested allowed, e.g. "rt-test/rt-test-nested"
 
 # --- Environment classification (case-insensitive, exact membership) ----------
 DEV_ENVIRONMENTS  = {"dev", "test", "qa"}
@@ -249,20 +249,29 @@ def resolve_snapshot(auth_header):
 
 
 def ensure_directory(auth_header, directory):
-    """Create the intent-check directory under root. Idempotent-ish: tolerate 'exists'."""
-    parent = urllib.parse.quote("/", safe="")   # %2F
-    qs = urllib.parse.urlencode({"action": "addDir", "name": directory})
-    url = f"{BASE_URL}/api/networks/{NETWORK_ID}/intent-check-directories/{parent}?{qs}"
-    status, text = http("POST", url, auth_header)
-    if status in (200, 201, 204):
-        print(f"  directory '/{directory}' created.")
-    else:
-        # Most likely already exists; log and continue.
-        print(f"  directory create returned {status} (continuing; likely already exists): {text[:200]}")
+    """
+    Create the intent-check directory, one level at a time. Supports nested
+    paths like "rt-test/rt-test-nested": each segment is created under its
+    parent. Idempotent-ish: a level that already exists is logged and skipped.
+    """
+    segments = [s for s in directory.strip("/").split("/") if s]
+    parent = "/"                                  # start at root
+    for seg in segments:
+        parent_enc = urllib.parse.quote(parent, safe="")   # e.g. "/" -> %2F, "/rt-test" -> %2Frt-test
+        qs = urllib.parse.urlencode({"action": "addDir", "name": seg})
+        url = f"{BASE_URL}/api/networks/{NETWORK_ID}/intent-check-directories/{parent_enc}?{qs}"
+        status, text = http("POST", url, auth_header)
+        full = ("/" + "/".join([p for p in (parent.strip("/"), seg) if p]))
+        if status in (200, 201, 204):
+            print(f"  directory '{full}' created.")
+        else:
+            # Most likely already exists; log and continue.
+            print(f"  directory '{full}' create returned {status} (continuing; likely exists): {text[:150]}")
+        parent = full
 
 
 def check_url(snapshot_id, directory):
-    params = [("path", "/" + directory)]
+    params = [("path", "/" + directory.strip("/"))]
     if PERSISTENT:
         params.append(("persistent", "true"))
     qs = urllib.parse.urlencode(params)
@@ -323,9 +332,11 @@ def main():
 
     if DRY_RUN:
         print("DRY RUN - no API calls will be made.\n")
-        print(f"Would create directory '/{DIRECTORY}' in network {NETWORK_ID}.")
+        dir_disp = "/" + DIRECTORY.strip("/")
+        print(f"Would create directory '{dir_disp}' in network {NETWORK_ID} "
+              f"(each level created in turn).")
         sid = SNAPSHOT_ID or "<latest processed snapshot>"
-        print(f"Would POST checks to snapshot {sid} at path '/{DIRECTORY}'.\n")
+        print(f"Would POST checks to snapshot {sid} at path '{dir_disp}'.\n")
         preview = pairs if len(pairs) <= 20 else pairs[:20]
         for src, dst in preview:
             payload = build_check(src, dst)
