@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Forward Networks - Posture Matrix first-hop device/VRF discovery.
+Forward Networks - Posture Matrix first-hop device/VRF discovery (streaming).
 
 PURPOSE
   When you define a Forward "posture" (isolation) resource pool you must ground
@@ -23,20 +23,30 @@ HOW IT WORKS
      subnet-facing interface. The first hop always belongs to the SOURCE subnet
      of that search, so we attribute (first-hop device, first-hop VRF) to the
      source subnet. Across the N returned paths there may be several distinct
-     first hops; we tally them all, ranked by how often each appears (any of
-     them could be the owning device/VRF).
-  4. We aggregate the results several ways and write CSVs:
-       - per_subnet_first_hops.csv : every (subnet, device, VRF) with counts
-       - pool_dev_*.csv / pool_prod_*.csv : the union for a whole env class
-         (grounding for a single "all dev" or "all prod" resource pool)
-       - by_device.csv : device -> which subnets/VRFs map to it (so you can
-         group devices a,b,c,d and read off the subnets/VRFs to use)
-       - by_vrf.csv    : VRF -> which subnets/devices map to it
-       - raw_first_hops.csv : one row per returned path (full audit trail)
-       - search_errors.csv  : any queries that errored / timed out / 0 results
+     first hops; we tally them all, ranked by how often each appears.
+  4. We aggregate the results several ways and write CSVs (see write_outputs).
 
-  Path search bulk API: POST /api/networks/{networkId}/paths-bulk
-  VRF requires includeNetworkFunctions=true (hop.networkFunctions.*.l3.vrf).
+TRANSPORT (why streaming)
+  Uses the streaming bulk endpoint:
+      POST /api/networks/{networkId}/paths-bulk-seq
+  It returns an RFC 7464 JSON text sequence - one result per query, each framed
+  by an ASCII Record Separator (0x1E) and a Line Feed (0x0A), in query order.
+  Because results stream back incrementally, the connection keeps sending bytes
+  and idle timeouts on intermediary load balancers don't trip (the failure mode
+  that closes a long single /paths-bulk response with "Remote end closed
+  connection without response"). VRF requires includeNetworkFunctions=true
+  (hop.networkFunctions.*.l3.vrf).
+
+RESILIENCE
+  - Every completed query is appended to OUTPUT_DIR/checkpoint.jsonl (fsync'd).
+  - A dropped/stalled connection is retried with exponential backoff; only the
+    queries not yet completed in that batch are re-sent.
+  - Re-running RESUMES from the checkpoint (skips already-done queries).
+    Use --fresh to ignore/overwrite it, or --rebuild to regenerate the CSVs
+    from an existing checkpoint without making any API calls.
+  - Aggregate CSVs are rewritten after every batch, so partial results are
+    always available.
+
   Only the Python standard library is used (no pip installs).
 
 USAGE
@@ -45,19 +55,24 @@ USAGE
          python3 forward_posture_matrix_pathsearch.py hosts.csv
   3. When satisfied, run for real:
          python3 forward_posture_matrix_pathsearch.py hosts.csv --commit
-  4. Tune bulk size / timeouts / result depth in CONFIG or via flags:
-         --bulk-size 20 --max-seconds 60 --max-overall-seconds 600 \
-         --max-results 200 --max-candidates 5000
+  4. If it stops, just re-run the same command to resume; or rebuild CSVs:
+         python3 forward_posture_matrix_pathsearch.py hosts.csv --rebuild
+  5. Tune per run:
+         --bulk-size 100 --max-results 100 --max-seconds 300 \
+         --max-overall-seconds 7200 --max-candidates 10000 --max-retries 5
 """
 
 import argparse
 import base64
 import csv
+import http.client
 import ipaddress
 import json
 import os
+import socket
 import ssl
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -83,29 +98,34 @@ PROD_ENVIRONMENTS = {"prod", "production", "prod2"}
 
 # --- Path search behavior ----------------------------------------------------
 # maxResults: how many paths each search returns. Higher = more distinct first
-#   hops captured (ECMP / multiple attachment points). Ranking prefers longer
-#   paths (greatest reach). Range 1-maxCandidates. We default high to capture
-#   the full set of first hops, not just one.
+#   hops captured (ECMP / multiple attachment points). Range 1-maxCandidates.
 MAX_RESULTS      = 200
 # maxCandidates: results computed before ranking. Range 1-10000.
 MAX_CANDIDATES   = 10000
 # Per-query timeout (seconds). Range 1-300.
 MAX_SECONDS      = 300
-# Overall timeout for one bulk POST (seconds). Range 1-7200 (7200 = max).
+# Overall timeout for one bulk request (seconds). Range 1-7200 (7200 = max).
 MAX_OVERALL_SECONDS = 7200
 # Search intent: PREFER_DELIVERED | PREFER_VIOLATIONS | VIOLATIONS_ONLY
 INTENT           = "PREFER_DELIVERED"
 
 # --- Bulk / transport tuning -------------------------------------------------
-BULK_SIZE    = 500      # queries per /paths-bulk POST (tune if you hit limits)
+BULK_SIZE    = 100      # queries per streaming POST (tune if you hit limits)
 VERIFY_TLS   = True     # set False only for self-signed on-prem instances
-# Socket timeout per HTTP request. Should exceed MAX_OVERALL_SECONDS so the
-# server-side timeout fires first with a clean per-query result.
-HTTP_TIMEOUT = None     # None -> auto (MAX_OVERALL_SECONDS + 30)
+# Per-read (inactivity) socket timeout in seconds. Because results stream in,
+# the gap between records is roughly one query's compute budget; a value a bit
+# above MAX_SECONDS catches a genuine stall without waiting for the whole run.
+# None -> auto (MAX_SECONDS + 60).
+HTTP_TIMEOUT = None
+
+# --- Retry on connection drop ------------------------------------------------
+MAX_RETRIES  = 5        # attempts per batch before giving up on its remainder
+BACKOFF_BASE = 2.0      # seconds; delay = BACKOFF_BASE * 2**(attempt-1)
+BACKOFF_MAX  = 60.0     # cap on backoff delay
 
 # --- IO ----------------------------------------------------------------------
 INPUT_CSV  = "hosts.csv"            # first CLI arg overrides this
-OUTPUT_DIR = "posture_matrix_out"   # CSVs are written here
+OUTPUT_DIR = "posture_matrix_out"   # CSVs + checkpoint are written here
 
 # Safety: dry run prints the query plan and makes no API calls.
 DRY_RUN = True
@@ -113,6 +133,26 @@ DRY_RUN = True
 # ============================================================================
 # End of CONFIG
 # ============================================================================
+
+# HTTP statuses worth retrying (transient / snapshot-processing / throttling).
+RETRYABLE_STATUS = {409, 429, 500, 502, 503, 504}
+
+
+class StreamError(Exception):
+    """Raised when the JSON-seq stream is truncated or a record won't parse;
+    treated as a retryable transport failure."""
+
+
+# Connection-level failures we retry. ConnectionError covers
+# RemoteDisconnected / ConnectionReset / ConnectionAborted.
+RETRYABLE_EXC = (
+    ConnectionError,
+    http.client.RemoteDisconnected,
+    http.client.IncompleteRead,
+    socket.timeout,
+    TimeoutError,
+    StreamError,
+)
 
 
 def _norm(s):
@@ -133,7 +173,8 @@ def _ssl_ctx():
 
 
 def http(method, url, auth_header, body=None, timeout=None):
-    """Minimal JSON HTTP helper. Returns (status_code, text)."""
+    """Minimal JSON HTTP helper for non-streaming calls (snapshot resolve).
+    Returns (status_code, text)."""
     data = None
     headers = {"Authorization": auth_header, "Accept": "application/json"}
     if body is not None:
@@ -156,9 +197,8 @@ def load_subnets(path):
     """
     Read the CSV and return two lists of dicts (dev, prod), each row:
         {"env": <raw Environment>, "subnet": <CIDR/IP string>}
-    The 'subnet' column is used as the search endpoint (resource pools ground
-    to subnets). Duplicate subnets within the same class are de-duplicated,
-    keeping the first Environment label seen.
+    The 'subnet' column is used as the search endpoint. Duplicate subnets within
+    the same class are de-duplicated, keeping the first Environment label seen.
     """
     with open(path, newline="", encoding="utf-8-sig") as fh:
         reader = csv.DictReader(fh)
@@ -179,7 +219,7 @@ def load_subnets(path):
         if subnet_c is None:
             raise SystemExit("ERROR: CSV must contain a 'subnet' column.")
 
-        dev, prod = {}, {}          # subnet -> env  (dict preserves de-dup)
+        dev, prod = {}, {}
         skipped, ignored = 0, 0
         for raw in reader:
             env = _norm(raw.get(env_c))
@@ -219,14 +259,8 @@ def classify(env):
 # ---------------------------------------------------------------------------
 
 def build_queries(dev_rows, prod_rows):
-    """
-    Yield one meta-record per ordered cross-class subnet pair, both directions:
-        dev -> prod   (source = dev subnet)
-        prod -> dev   (source = prod subnet)
-    The first hop of each search belongs to the SOURCE subnet, so we tag each
-    query with its source subnet/env and destination subnet/env. Self-pairs
-    (identical src/dst string) are skipped.
-    """
+    """Yield one meta-record per ordered cross-class subnet pair, both
+    directions. The first hop of each search belongs to the SOURCE subnet."""
     out = []
     for d in dev_rows:
         for p in prod_rows:
@@ -261,16 +295,54 @@ def resolve_snapshot(auth_header):
     return str(sid)
 
 
-def bulk_url(snapshot_id):
+def _seq_url(snapshot_id):
     qs = urllib.parse.urlencode({"snapshotId": snapshot_id}) if snapshot_id else ""
-    base = f"{BASE_URL}/api/networks/{NETWORK_ID}/paths-bulk"
+    base = f"{BASE_URL}/api/networks/{NETWORK_ID}/paths-bulk-seq"
     return f"{base}?{qs}" if qs else base
 
 
-def run_bulk(auth_header, snapshot_id, batch):
-    """POST one batch of queries. Returns (ok, parsed_list_or_None, err_text)."""
+def iter_json_seq(resp, chunk_size=65536):
+    """Yield parsed JSON objects from an RFC 7464 json-seq HTTP response.
+    Each record is framed as: RS (0x1E) <json> LF (0x0A). We split on RS; every
+    segment except the trailing (possibly incomplete) one is a complete record.
+    A malformed complete record indicates truncation -> StreamError."""
+    buf = b""
+    while True:
+        try:
+            piece = resp.read(chunk_size)
+        except http.client.IncompleteRead as e:
+            piece = e.partial
+            if not piece:
+                break
+        if not piece:
+            break
+        buf += piece
+        parts = buf.split(b"\x1e")
+        buf = parts.pop()               # keep trailing (maybe partial) record
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                yield json.loads(part.decode("utf-8", "replace"))
+            except json.JSONDecodeError as e:
+                raise StreamError(f"bad record: {e}")
+    tail = buf.strip()
+    if tail:
+        for seg in tail.split(b"\x1e"):
+            seg = seg.strip()
+            if not seg:
+                continue
+            try:
+                yield json.loads(seg.decode("utf-8", "replace"))
+            except json.JSONDecodeError as e:
+                raise StreamError(f"bad final record: {e}")
+
+
+def stream_bulk_seq(auth_header, snapshot_id, queries):
+    """Generator yielding (query, result_obj) pairs in order as they stream."""
     body = {
-        "queries": [{"srcIp": q["src"], "dstIp": q["dst"]} for q in batch],
+        "queries": [{"srcIp": q["src"], "dstIp": q["dst"]} for q in queries],
         "intent": INTENT,
         "maxResults": MAX_RESULTS,
         "maxCandidates": MAX_CANDIDATES,
@@ -278,19 +350,22 @@ def run_bulk(auth_header, snapshot_id, batch):
         "maxOverallSeconds": MAX_OVERALL_SECONDS,
         "includeNetworkFunctions": True,   # required for VRF
     }
-    timeout = HTTP_TIMEOUT or (MAX_OVERALL_SECONDS + 30)
-    status, text = http("POST", bulk_url(snapshot_id), auth_header,
-                        body=body, timeout=timeout)
-    if not (200 <= status < 300):
-        return False, None, f"HTTP {status}: {text[:400]}"
+    data = json.dumps(body).encode("utf-8")
+    headers = {"Authorization": auth_header,
+               "Content-Type": "application/json",
+               "Accept": "application/json-seq"}
+    req = urllib.request.Request(_seq_url(snapshot_id), data=data,
+                                 method="POST", headers=headers)
+    read_timeout = HTTP_TIMEOUT or (MAX_SECONDS + 60)
+    resp = urllib.request.urlopen(req, context=_ssl_ctx(), timeout=read_timeout)
     try:
-        results = json.loads(text)
-    except json.JSONDecodeError as e:
-        return False, None, f"bad JSON: {e}: {text[:200]}"
-    if not isinstance(results, list) or len(results) != len(batch):
-        return False, None, (f"expected {len(batch)} results, got "
-                             f"{len(results) if isinstance(results, list) else type(results)}")
-    return True, results, ""
+        for q, obj in zip(queries, iter_json_seq(resp)):
+            yield q, obj
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -298,9 +373,8 @@ def run_bulk(auth_header, snapshot_id, batch):
 # ---------------------------------------------------------------------------
 
 def first_hop_vrf(hop):
-    """Return the VRF on the subnet-facing interface of a first hop.
-    Prefer the ingress interface (where the source subnet's traffic entered the
-    device); fall back to egress; else None."""
+    """VRF on the subnet-facing interface of a first hop: prefer ingress
+    (where the source subnet's traffic entered), fall back to egress."""
     nf = (hop or {}).get("networkFunctions") or {}
     for side in ("ingress", "egress"):
         l3 = (nf.get(side) or {}).get("l3") or {}
@@ -311,11 +385,8 @@ def first_hop_vrf(hop):
 
 
 def parse_result(result):
-    """
-    Given one PathSearchResponse, return (paths_info, error_text).
-    paths_info is a list of per-path dicts: device, vrf, outcome, hop_count.
-    If the element is an error object, error_text is set and paths_info is [].
-    """
+    """Given one PathSearchResponse (or error object), return
+    (paths_info, error_text). paths_info: list of per-path first-hop dicts."""
     if isinstance(result, dict) and result.get("error"):
         msg = result.get("message") or result.get("reason") or json.dumps(result)[:200]
         return [], f"query error: {msg}"
@@ -350,8 +421,6 @@ class Aggregator:
     """Accumulates first-hop findings keyed by the SOURCE subnet."""
 
     def __init__(self):
-        # subnet -> {"env":.., "class":.., "dev_vrf":Counter{(device,vrf):paths},
-        #            "dests": set(), "paths": int}
         self.subnets = {}
         self.raw = []   # one row per returned path (audit)
 
@@ -390,6 +459,117 @@ class Aggregator:
 
 
 # ---------------------------------------------------------------------------
+# Run bookkeeping: checkpoint + retryable batch processing
+# ---------------------------------------------------------------------------
+
+class Runner:
+    """Feeds streamed results into the aggregator and checkpoints each one."""
+
+    def __init__(self, agg, cp_file, errors=None):
+        self.agg = agg
+        self.cp = cp_file          # append-mode file handle, or None
+        self.errors = list(errors or [])
+
+    def _checkpoint(self, q, paths_info, err):
+        if self.cp is None:
+            return
+        self.cp.write(json.dumps({"q": q, "paths": paths_info, "err": err}) + "\n")
+        self.cp.flush()
+        try:
+            os.fsync(self.cp.fileno())
+        except (OSError, ValueError):
+            pass
+
+    def handle_result(self, q, result):
+        paths_info, err = parse_result(result)
+        self.agg.add(q, paths_info)
+        if err:
+            self.errors.append((q["src"], q["dst"], err))
+        self._checkpoint(q, paths_info, err)
+
+    def handle_error(self, q, msg, persist=True):
+        self.agg.add(q, [])
+        self.errors.append((q["src"], q["dst"], msg))
+        if persist:
+            self._checkpoint(q, [], msg)
+
+
+def process_batch(auth, snapshot_id, batch, runner, label=""):
+    """Stream one batch, retrying only the not-yet-completed remainder on drop.
+    Returns True if every query in the batch was resolved."""
+    remaining = list(batch)
+    attempt = 0
+    while remaining:
+        attempt += 1
+        consumed = 0
+        try:
+            for q, result in stream_bulk_seq(auth, snapshot_id, remaining):
+                runner.handle_result(q, result)
+                consumed += 1
+            remaining = remaining[consumed:]
+            if not remaining:
+                return True
+            print(f"    {label} stream ended early ({consumed} this attempt); "
+                  f"{len(remaining)} remaining")
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = e.read().decode("utf-8", "replace")[:300]
+            except Exception:
+                pass
+            if e.code not in RETRYABLE_STATUS:
+                print(f"    {label} HTTP {e.code} (non-retryable): {body}")
+                for q in remaining:
+                    runner.handle_error(q, f"HTTP {e.code}: {body}")
+                return False
+            print(f"    {label} HTTP {e.code} (retryable): {body}")
+        except RETRYABLE_EXC as e:
+            remaining = remaining[consumed:]
+            print(f"    {label} connection issue after {consumed} result(s): "
+                  f"{type(e).__name__}: {e}")
+        except urllib.error.URLError as e:
+            remaining = remaining[consumed:]
+            print(f"    {label} URL error after {consumed}: {e}")
+
+        if attempt >= MAX_RETRIES:
+            print(f"    {label} giving up after {attempt} attempts; "
+                  f"{len(remaining)} queries unresolved (will retry on re-run)")
+            for q in remaining:
+                # don't persist -> a re-run will retry these
+                runner.handle_error(q, f"unresolved after {attempt} attempts",
+                                    persist=False)
+            return False
+        delay = min(BACKOFF_BASE * (2 ** (attempt - 1)), BACKOFF_MAX)
+        print(f"    {label} retrying in {delay:.0f}s "
+              f"(attempt {attempt + 1}/{MAX_RETRIES})")
+        time.sleep(delay)
+    return True
+
+
+def load_checkpoint(cp_path, agg):
+    """Replay a checkpoint into the aggregator. Returns (done_set, errors)."""
+    done = set()
+    errors = []
+    if not os.path.exists(cp_path):
+        return done, errors
+    with open(cp_path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            q = rec["q"]
+            agg.add(q, rec.get("paths") or [])
+            if rec.get("err"):
+                errors.append((q["src"], q["dst"], rec["err"]))
+            done.add((q["src"], q["dst"]))
+    return done, errors
+
+
+# ---------------------------------------------------------------------------
 # CSV writers
 # ---------------------------------------------------------------------------
 
@@ -398,10 +578,9 @@ def _write(path, header, rows):
         w = csv.writer(fh)
         w.writerow(header)
         w.writerows(rows)
-    print(f"  wrote {path}  ({len(rows)} row(s))")
 
 
-def write_outputs(agg, outdir):
+def write_outputs(agg, outdir, verbose=True):
     os.makedirs(outdir, exist_ok=True)
 
     # 1. per-subnet first hops: one row per (subnet, device, vrf)
@@ -493,6 +672,9 @@ def write_outputs(agg, outdir):
              r["first_hop_device"], r["first_hop_display"], r["first_hop_vrf"],
              r["forwarding_outcome"], r["security_outcome"], r["hop_count"]]
             for r in agg.raw])
+    if verbose:
+        print(f"  CSVs updated in ./{outdir}/ "
+              f"({len(agg.subnets)} subnets, {len(agg.raw)} first-hop paths)")
 
 
 def write_errors(errors, outdir):
@@ -507,7 +689,6 @@ def write_errors(errors, outdir):
 # ---------------------------------------------------------------------------
 
 def _validate_subnet(v):
-    """Best-effort validation; accepts bare IP or CIDR. Returns True/False."""
     try:
         if "/" in v:
             ipaddress.ip_network(v, strict=False)
@@ -521,26 +702,33 @@ def _validate_subnet(v):
 def main():
     global DRY_RUN, INPUT_CSV, API_KEY, API_SECRET, NETWORK_ID, SNAPSHOT_ID
     global BULK_SIZE, MAX_RESULTS, MAX_CANDIDATES, MAX_SECONDS
-    global MAX_OVERALL_SECONDS, OUTPUT_DIR
+    global MAX_OVERALL_SECONDS, MAX_RETRIES, OUTPUT_DIR
 
     ap = argparse.ArgumentParser(
         description="Discover first-hop devices/VRFs per subnet for posture "
-                    "resource-pool grounding, via Forward bulk path search.")
+                    "resource-pool grounding, via Forward streaming bulk path "
+                    "search (resumable).")
     ap.add_argument("csv", nargs="?", default=INPUT_CSV, help="input CSV path")
     ap.add_argument("--commit", action="store_true",
                     help="actually run path searches (disables dry run)")
     ap.add_argument("--dry-run", action="store_true", help="force dry run (default)")
-    ap.add_argument("--out", default=None, help="output directory for CSVs")
+    ap.add_argument("--rebuild", action="store_true",
+                    help="rebuild CSVs from an existing checkpoint; no API calls")
+    ap.add_argument("--fresh", action="store_true",
+                    help="ignore/overwrite any existing checkpoint and start over")
+    ap.add_argument("--out", default=None, help="output directory")
     ap.add_argument("--bulk-size", type=int, default=None,
-                    help=f"queries per bulk POST (default {BULK_SIZE})")
+                    help=f"queries per streaming POST (default {BULK_SIZE})")
     ap.add_argument("--max-results", type=int, default=None,
                     help=f"paths returned per search (default {MAX_RESULTS})")
     ap.add_argument("--max-candidates", type=int, default=None,
-                    help=f"candidates computed before ranking (default {MAX_CANDIDATES})")
+                    help=f"candidates before ranking (default {MAX_CANDIDATES})")
     ap.add_argument("--max-seconds", type=int, default=None,
                     help=f"per-query timeout (default {MAX_SECONDS})")
     ap.add_argument("--max-overall-seconds", type=int, default=None,
-                    help=f"per-batch timeout (default {MAX_OVERALL_SECONDS})")
+                    help=f"per-request timeout (default {MAX_OVERALL_SECONDS})")
+    ap.add_argument("--max-retries", type=int, default=None,
+                    help=f"retries per batch on drop (default {MAX_RETRIES})")
     ap.add_argument("--snapshot-id", default=None, help="override snapshot id")
     args = ap.parse_args()
 
@@ -561,11 +749,26 @@ def main():
         MAX_SECONDS = args.max_seconds
     if args.max_overall_seconds is not None:
         MAX_OVERALL_SECONDS = args.max_overall_seconds
+    if args.max_retries is not None:
+        MAX_RETRIES = args.max_retries
 
     API_KEY    = os.environ.get("FWD_API_KEY", API_KEY)
     API_SECRET = os.environ.get("FWD_API_SECRET", API_SECRET)
     NETWORK_ID = os.environ.get("FWD_NETWORK_ID", NETWORK_ID)
     SNAPSHOT_ID = args.snapshot_id or os.environ.get("FWD_SNAPSHOT_ID", SNAPSHOT_ID)
+
+    cp_path = os.path.join(OUTPUT_DIR, "checkpoint.jsonl")
+
+    # --- rebuild-only: no CSV read of queries, just replay checkpoint ---
+    if args.rebuild:
+        agg = Aggregator()
+        done, errors = load_checkpoint(cp_path, agg)
+        if not done:
+            raise SystemExit(f"No checkpoint at {cp_path} to rebuild from.")
+        write_outputs(agg, OUTPUT_DIR)
+        write_errors(errors, OUTPUT_DIR)
+        print(f"Rebuilt CSVs from {len(done)} checkpointed queries.")
+        return
 
     print(f"Input CSV : {INPUT_CSV}")
     dev_rows, prod_rows = load_subnets(INPUT_CSV)
@@ -574,32 +777,30 @@ def main():
         raise SystemExit("Nothing to do: need at least one DEV subnet and one "
                          "PROD subnet.")
 
-    # sanity-check subnet strings (warn only; the API is the final judge)
     bad = [r["subnet"] for r in (dev_rows + prod_rows)
            if not _validate_subnet(r["subnet"])]
     if bad:
         print(f"  WARNING: {len(bad)} subnet value(s) don't parse as IP/CIDR "
               f"and may be rejected: {bad[:5]}{'...' if len(bad) > 5 else ''}")
 
-    queries = build_queries(dev_rows, prod_rows)
-    print(f"Planned searches: {len(queries)}  "
+    all_queries = build_queries(dev_rows, prod_rows)
+    print(f"Planned searches: {len(all_queries)}  "
           f"(both directions across {len(dev_rows)}x{len(prod_rows)} pairs)")
-    print(f"Bulk size: {BULK_SIZE}  ->  {(-(-len(queries) // BULK_SIZE))} POST(s)")
-    print(f"maxResults={MAX_RESULTS} maxCandidates={MAX_CANDIDATES} "
-          f"maxSeconds={MAX_SECONDS} maxOverallSeconds={MAX_OVERALL_SECONDS} "
-          f"intent={INTENT}")
+    print(f"Bulk size: {BULK_SIZE}   maxResults={MAX_RESULTS} "
+          f"maxCandidates={MAX_CANDIDATES} maxSeconds={MAX_SECONDS} "
+          f"maxOverallSeconds={MAX_OVERALL_SECONDS} intent={INTENT}")
+    print(f"Endpoint  : {_seq_url(SNAPSHOT_ID or '<latest processed>')}")
     print("-" * 70)
 
     if DRY_RUN:
         print("DRY RUN - no API calls will be made.\n")
-        preview = queries[:10]
-        for q in preview:
+        for q in all_queries[:10]:
             print(f"  {q['src_class']:>4} {q['src']:<20} -> "
                   f"{q['dst_class']:<4} {q['dst']}")
-        if len(queries) > len(preview):
-            print(f"  ... and {len(queries) - len(preview)} more.")
-        print(f"\nWould POST to {bulk_url(SNAPSHOT_ID or '<latest processed>')}")
-        print(f"Would write CSVs to ./{OUTPUT_DIR}/")
+        if len(all_queries) > 10:
+            print(f"  ... and {len(all_queries) - 10} more.")
+        print(f"\nWould stream to {_seq_url(SNAPSHOT_ID or '<latest processed>')}")
+        print(f"Would checkpoint to ./{cp_path} and write CSVs to ./{OUTPUT_DIR}/")
         print("\nRe-run with --commit to execute the searches.")
         return
 
@@ -607,38 +808,53 @@ def main():
     if not API_KEY or not API_SECRET:
         raise SystemExit("ERROR: API_KEY/API_SECRET are required to commit "
                          "(set in CONFIG or via FWD_API_KEY / FWD_API_SECRET).")
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    agg = Aggregator()
+    prior_errors = []
+    if args.fresh and os.path.exists(cp_path):
+        os.remove(cp_path)
+        print("Fresh run: removed existing checkpoint.")
+    done = set()
+    if os.path.exists(cp_path):
+        done, prior_errors = load_checkpoint(cp_path, agg)
+        print(f"Resuming: {len(done)} queries already in checkpoint "
+              f"({len(agg.raw)} first-hop paths replayed).")
+
+    queries = [q for q in all_queries if (q["src"], q["dst"]) not in done]
+    print(f"Remaining to search: {len(queries)}")
+    if not queries:
+        write_outputs(agg, OUTPUT_DIR)
+        write_errors(prior_errors, OUTPUT_DIR)
+        print("Nothing left to do; CSVs rebuilt from checkpoint.")
+        return
+
     auth = _basic_auth_header(API_KEY, API_SECRET)
     snapshot_id = resolve_snapshot(auth)
     print(f"Snapshot  : {snapshot_id}")
+    print("-" * 70)
 
-    agg = Aggregator()
-    errors = []
+    cp = open(cp_path, "a", encoding="utf-8")
+    runner = Runner(agg, cp, errors=prior_errors)
     batches = list(chunk(queries, BULK_SIZE))
-    for bi, batch in enumerate(batches, 1):
-        ok, results, err = run_bulk(auth, snapshot_id, batch)
-        if not ok:
-            print(f"[batch {bi}/{len(batches)}] FAILED: {err}")
-            for q in batch:
-                errors.append((q["src"], q["dst"], f"batch error: {err}"))
-            continue
-        batch_paths = 0
-        for q, result in zip(batch, results):
-            paths_info, perr = parse_result(result)
-            agg.add(q, paths_info)
-            batch_paths += len(paths_info)
-            if perr:
-                errors.append((q["src"], q["dst"], perr))
-        print(f"[batch {bi}/{len(batches)}] ok  "
-              f"{len(batch)} queries, {batch_paths} first-hop paths")
+    try:
+        for bi, batch in enumerate(batches, 1):
+            label = f"[batch {bi}/{len(batches)}]"
+            before = len(agg.raw)
+            ok = process_batch(auth, snapshot_id, batch, runner, label)
+            got = len(agg.raw) - before
+            print(f"{label} {'ok' if ok else 'PARTIAL'}: "
+                  f"{len(batch)} queries, {got} first-hop paths")
+            write_outputs(agg, OUTPUT_DIR)
+            write_errors(runner.errors, OUTPUT_DIR)
+    finally:
+        cp.close()
 
     print("-" * 70)
-    write_outputs(agg, OUTPUT_DIR)
-    if errors:
-        write_errors(errors, OUTPUT_DIR)
-    print(f"\nDone. Subnets with findings: {len(agg.subnets)}   "
+    print(f"Done. Subnets with findings: {len(agg.subnets)}   "
           f"Total first-hop paths: {len(agg.raw)}   "
-          f"Queries with no result: {len(errors)}")
-    print(f"CSVs in ./{OUTPUT_DIR}/")
+          f"Queries with no/failed result: {len(runner.errors)}")
+    print(f"CSVs + checkpoint in ./{OUTPUT_DIR}/")
 
 
 if __name__ == "__main__":
