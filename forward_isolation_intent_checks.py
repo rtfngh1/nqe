@@ -12,26 +12,33 @@ Two input shapes are supported (columns are matched case-insensitively):
   2. Subnet:    "Environment", "Subnet"                       -> checks per subnet
 
 For every DEV row x every PROD row a pair of Isolation checks is created
-(dev -> prod and prod -> dev), because DIRECTION defaults to "both".
+(dev -> prod and prod -> dev) when DIRECTION is "both".
 
-Only the Python standard library is used (no pip installs).
+Only the Python standard library is used (no pip installs). Works on Windows
+(invoke with `python`), macOS, and Linux.
 
 USAGE
-  1. Fill in the CONFIG block below (or override via env vars / CLI flags).
-  2. Run a dry run first (default) to review what would be created:
-         python3 forward_isolation_intent_checks.py hosts.csv
-  3. When satisfied, actually create the checks:
-         python3 forward_isolation_intent_checks.py hosts.csv --commit
+  1. Fill in the CONFIG block below (or override with env vars / CLI flags).
+  2. Dry run first (default) to review what would be created:
+         python forward_isolation_intent_checks.py hosts.csv
+  3. Create the checks:
+         python forward_isolation_intent_checks.py hosts.csv --commit
+  4. If a long run stops partway, resume by skipping the ones already made:
+         python forward_isolation_intent_checks.py hosts.csv --commit --start 2000
 """
 
 import argparse
 import base64
 import csv
+import http.client
 import itertools
 import json
 import os
+import random
+import socket
 import ssl
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -41,7 +48,7 @@ import urllib.request
 # ============================================================================
 
 # --- API credentials & target -------------------------------------------------
-BASE_URL   = "https://fwd.app"          # Forward instance base URL (no trailing /api)
+BASE_URL   = "https://fwd.app"           # Forward instance base URL (no trailing /api)
 API_KEY    = ""                          # API access key  (or username)   [env: FWD_API_KEY]
 API_SECRET = ""                          # API secret key  (or password)   [env: FWD_API_SECRET]
 NETWORK_ID = "159020"                    # Forward network ID
@@ -60,10 +67,34 @@ PROD_ENVIRONMENTS = {"prod", "production", "prod2"}
 
 # --- Behavior ------------------------------------------------------------------
 DIRECTION   = "both"     # "both" (dev->prod and prod->dev) | "dev_to_prod" | "prod_to_dev"
+
+# Route every check "through" this device group (a Forward Device Group ->
+# DeviceAliasFilter). Applies to the whole run. Leave "" to omit the through hop.
+# Overridable per run with --through <group>.
+THROUGH_DEVICE_GROUP = "jfk-campus"
+
+# How to express the destination in the check (in-script constant).
+#   "to"      -> destination as a 'to' location (SubnetLocationFilter). RECOMMENDED
+#                default: it localizes BOTH source and destination in the topology,
+#                which is what an isolation/existence check should verify.
+#   "dest-ip" -> destination as an ipv4_dst packet filter on the 'from' clause.
+#                This only matches the packet's destination field; it does NOT
+#                localize where the destination sits. Only use it when you also set
+#                THROUGH_DEVICE_GROUP (or otherwise add enough 'through' hops) so the
+#                check represents a full, well-defined flow. See
+#                NQE Reference/Forward_Intent_Check_API.md (Best practice).
+DEST_MODE   = "to"       # "to" | "dest-ip"
+
 ASYNC       = True       # mirror the UI: submit checks asynchronously
 PERSISTENT  = True       # associate checks with later/future snapshots too
 VERIFY_TLS  = True       # set False only for self-signed on-prem instances
 HTTP_TIMEOUT = 60        # seconds per request
+
+# --- Retry (for momentary instance hiccups: read timeouts, resets, 5xx) --------
+MAX_RETRIES       = 5           # extra attempts after the first, per request
+RETRY_BACKOFF_SEC = 2.0         # base delay; doubles each attempt (2, 4, 8, ...)
+RETRY_MAX_SLEEP   = 30          # cap on any single backoff sleep (seconds)
+RETRY_ON_STATUS   = {429, 500, 502, 503, 504}   # HTTP statuses worth retrying
 
 # Input CSV (can also be passed as the first CLI argument)
 INPUT_CSV = "hosts.csv"
@@ -94,19 +125,60 @@ def _ssl_ctx():
     return ctx
 
 
+# Transient transport errors worth retrying (timeouts, resets, dropped connections).
+# Note: HTTPError is caught separately/earlier; it subclasses URLError.
+TRANSIENT_EXC = (
+    TimeoutError,
+    socket.timeout,
+    urllib.error.URLError,
+    ConnectionError,
+    ssl.SSLError,
+    http.client.HTTPException,
+)
+
+
+def _backoff_sleep(attempt, reason):
+    delay = min(RETRY_BACKOFF_SEC * (2 ** (attempt - 1)), RETRY_MAX_SLEEP)
+    delay += random.uniform(0, delay * 0.25)   # jitter to avoid thundering herd
+    print(f"    transient failure ({reason}); retry {attempt}/{MAX_RETRIES} in {delay:.1f}s")
+    time.sleep(delay)
+
+
 def http(method, url, auth_header, body=None):
-    """Minimal JSON HTTP helper. Returns (status_code, text). Raises on transport error."""
+    """
+    JSON HTTP helper with retry/backoff. Returns (status_code, text).
+
+    Retries on transient transport errors (read timeouts, connection resets, etc.)
+    and on retryable HTTP statuses (RETRY_ON_STATUS), with exponential backoff +
+    jitter. Raises the last transport exception only if all attempts are exhausted;
+    non-retryable HTTP errors are returned as (code, text) for the caller to handle.
+    """
     data = None
     headers = {"Authorization": auth_header, "Accept": "application/json"}
     if body is not None:
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, method=method, headers=headers)
-    try:
-        with urllib.request.urlopen(req, context=_ssl_ctx(), timeout=HTTP_TIMEOUT) as resp:
-            return resp.status, resp.read().decode("utf-8", "replace")
-    except urllib.error.HTTPError as e:
-        return e.code, e.read().decode("utf-8", "replace")
+
+    last_exc = None
+    for attempt in range(1, MAX_RETRIES + 2):   # first try + MAX_RETRIES retries
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, context=_ssl_ctx(), timeout=HTTP_TIMEOUT) as resp:
+                return resp.status, resp.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            code = e.code
+            text = e.read().decode("utf-8", "replace")
+            if code in RETRY_ON_STATUS and attempt <= MAX_RETRIES:
+                _backoff_sleep(attempt, f"HTTP {code}")
+                continue
+            return code, text
+        except TRANSIENT_EXC as e:
+            last_exc = e
+            if attempt <= MAX_RETRIES:
+                _backoff_sleep(attempt, type(e).__name__)
+                continue
+            raise
+    raise last_exc  # pragma: no cover (loop always returns/raises above)
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +194,6 @@ def load_rows(path):
         reader = csv.DictReader(fh)
         if not reader.fieldnames:
             raise SystemExit(f"ERROR: {path} has no header row.")
-        # Map normalized header -> actual header
         hmap = {h.strip().lower(): h for h in reader.fieldnames}
 
         def col(*names):
@@ -139,29 +210,24 @@ def load_rows(path):
         if env_c is None:
             raise SystemExit("ERROR: CSV must contain an 'Environment' column.")
         if ip_c is not None:
-            mode = "ip"
-            value_c = ip_c
+            mode, value_c = "ip", ip_c
         elif subnet_c is not None:
-            mode = "subnet"
-            value_c = subnet_c
+            mode, value_c = "subnet", subnet_c
         else:
             raise SystemExit("ERROR: CSV must contain either an 'ip' or a 'subnet' column.")
 
-        rows = []
-        skipped = 0
+        rows, skipped = [], 0
         for raw in reader:
             env = _norm(raw.get(env_c))
             value = _norm(raw.get(value_c))
             if not value:
-                # In ip mode, fall back to subnet if the ip cell is blank.
                 if mode == "ip" and subnet_c is not None:
                     value = _norm(raw.get(subnet_c))
                 if not value:
                     skipped += 1
                     continue
             host = _norm(raw.get(host_c)) if host_c else ""
-            label = host if host else value
-            rows.append({"env": env, "value": value, "label": label})
+            rows.append({"env": env, "value": value, "label": host if host else value})
         if skipped:
             print(f"  (skipped {skipped} row(s) with no usable {mode} value)")
     return mode, rows
@@ -183,22 +249,33 @@ def classify(env):
 def build_check(src, dst):
     """
     Build the NewNetworkCheck payload for 'src should NOT reach dst'.
-    Shape mirrors exactly what the Forward UI posts for an Isolation check:
-    source is the 'from' location; destination is an ipv4_dst packet filter.
+
+    - "to" mode:      from.location = src, to.location = dst  (localizes both ends)
+    - "dest-ip" mode: from.location = src, from.headers ipv4_dst = dst
+    - THROUGH_DEVICE_GROUP, if set, adds a 'through' chain hop (DeviceAliasFilter).
     """
     name = f"[ISO] {src['label']} ({src['env']}) -x-> {dst['label']} ({dst['env']})"
     note = (f"{src['label']} ({src['env']}) should not be able to reach "
             f"{dst['label']} ({dst['env']})")
+
+    filters = {}
+    if THROUGH_DEVICE_GROUP:
+        filters["chain"] = [{
+            "transitType": "through",
+            "location": {"type": "DeviceAliasFilter", "value": THROUGH_DEVICE_GROUP},
+        }]
+
+    frm = {"location": {"type": "SubnetLocationFilter", "value": src["value"]}}
+    if DEST_MODE == "to":
+        filters["from"] = frm
+        filters["to"] = {"location": {"type": "SubnetLocationFilter", "value": dst["value"]}}
+    else:  # "dest-ip"
+        frm["headers"] = [{"type": "PacketFilter", "values": {"ipv4_dst": [dst["value"]]}}]
+        filters["from"] = frm
+
     definition = {
         "checkType": "Isolation",
-        "filters": {
-            "from": {
-                "location": {"type": "SubnetLocationFilter", "value": src["value"]},
-                "headers": [
-                    {"type": "PacketFilter", "values": {"ipv4_dst": [dst["value"]]}}
-                ],
-            }
-        },
+        "filters": filters,
         "noiseTypes": ["NETWORK_OR_BROADCAST_ADDRESS"],
         "headerFieldsWithDefaults": ["url"],
     }
@@ -255,17 +332,16 @@ def ensure_directory(auth_header, directory):
     parent. Idempotent-ish: a level that already exists is logged and skipped.
     """
     segments = [s for s in directory.strip("/").split("/") if s]
-    parent = "/"                                  # start at root
+    parent = "/"
     for seg in segments:
-        parent_enc = urllib.parse.quote(parent, safe="")   # e.g. "/" -> %2F, "/rt-test" -> %2Frt-test
+        parent_enc = urllib.parse.quote(parent, safe="")   # "/" -> %2F, "/rt-test" -> %2Frt-test
         qs = urllib.parse.urlencode({"action": "addDir", "name": seg})
         url = f"{BASE_URL}/api/networks/{NETWORK_ID}/intent-check-directories/{parent_enc}?{qs}"
         status, text = http("POST", url, auth_header)
-        full = ("/" + "/".join([p for p in (parent.strip("/"), seg) if p]))
+        full = "/" + "/".join([p for p in (parent.strip("/"), seg) if p])
         if status in (200, 201, 204):
             print(f"  directory '{full}' created.")
         else:
-            # Most likely already exists; log and continue.
             print(f"  directory '{full}' create returned {status} (continuing; likely exists): {text[:150]}")
         parent = full
 
@@ -281,8 +357,7 @@ def check_url(snapshot_id, directory):
 
 
 def create_check(auth_header, url, payload):
-    status, text = http("POST", url, auth_header, body=payload)
-    return status, text
+    return http("POST", url, auth_header, body=payload)
 
 
 # ---------------------------------------------------------------------------
@@ -290,12 +365,17 @@ def create_check(auth_header, url, payload):
 # ---------------------------------------------------------------------------
 
 def main():
-    global DRY_RUN, INPUT_CSV, API_KEY, API_SECRET
+    global DRY_RUN, INPUT_CSV, API_KEY, API_SECRET, THROUGH_DEVICE_GROUP
 
     ap = argparse.ArgumentParser(description="Bulk-create Forward Isolation intent checks from a CSV.")
     ap.add_argument("csv", nargs="?", default=INPUT_CSV, help="input CSV path")
     ap.add_argument("--commit", action="store_true", help="actually create checks (disables dry run)")
     ap.add_argument("--dry-run", action="store_true", help="force dry run (default)")
+    ap.add_argument("--through", default=None, metavar="GROUP",
+                    help="device group to route every check 'through' (overrides THROUGH_DEVICE_GROUP; "
+                         "use '' to disable)")
+    ap.add_argument("--start", type=int, default=0, metavar="N",
+                    help="skip the first N planned checks (resume a run that stopped partway)")
     args = ap.parse_args()
 
     INPUT_CSV = args.csv
@@ -303,6 +383,8 @@ def main():
         DRY_RUN = False
     if args.dry_run:
         DRY_RUN = True
+    if args.through is not None:
+        THROUGH_DEVICE_GROUP = args.through
 
     API_KEY = os.environ.get("FWD_API_KEY", API_KEY)
     API_SECRET = os.environ.get("FWD_API_SECRET", API_SECRET)
@@ -327,26 +409,43 @@ def main():
 
     pairs = list(plan_pairs(dev_rows, prod_rows))
     print(f"Direction : {DIRECTION}")
+    print(f"Dest mode : {DEST_MODE}")
+    print(f"Through   : {THROUGH_DEVICE_GROUP or '(none)'}")
+
+    if DEST_MODE == "dest-ip" and not THROUGH_DEVICE_GROUP:
+        print("\n!! WARNING: DEST_MODE='dest-ip' with no 'through' hop.")
+        print("   An ipv4_dst filter matches the packet's destination field but does NOT")
+        print("   localize the destination in the network, so the check may not represent a")
+        print("   real end-to-end flow. Prefer DEST_MODE='to', or set a 'through' group.")
+        print("   See NQE Reference/Forward_Intent_Check_API.md (Best practice).\n")
+
     print(f"Planned checks: {len(pairs)}")
+    if args.start:
+        print(f"Resuming    : skipping first {args.start}")
     print("-" * 70)
 
     if DRY_RUN:
         print("DRY RUN - no API calls will be made.\n")
         dir_disp = "/" + DIRECTORY.strip("/")
-        print(f"Would create directory '{dir_disp}' in network {NETWORK_ID} "
-              f"(each level created in turn).")
+        print(f"Would create directory '{dir_disp}' in network {NETWORK_ID} (each level created in turn).")
         sid = SNAPSHOT_ID or "<latest processed snapshot>"
         print(f"Would POST checks to snapshot {sid} at path '{dir_disp}'.\n")
-        preview = pairs if len(pairs) <= 20 else pairs[:20]
-        for src, dst in preview:
+        shown = 0
+        for idx, (src, dst) in enumerate(pairs, 1):
+            if idx <= args.start:
+                continue
+            if shown >= 20:
+                break
             payload = build_check(src, dst)
             print(f"URL : {check_url(str(sid), DIRECTORY)}")
             print(f"NAME: {payload['name']}")
             print(f"NOTE: {payload['note']}")
             print(f"BODY: {json.dumps(payload['definition'], separators=(',', ':'))}")
             print()
-        if len(pairs) > len(preview):
-            print(f"... and {len(pairs) - len(preview)} more (showing first {len(preview)}).")
+            shown += 1
+        remaining = len(pairs) - args.start - shown
+        if remaining > 0:
+            print(f"... and {remaining} more (showing first {shown}).")
         print("\nRe-run with --commit to create these checks.")
         return
 
@@ -361,19 +460,32 @@ def main():
     ensure_directory(auth, DIRECTORY)
     url = check_url(snapshot_id, DIRECTORY)
 
-    ok, fail = 0, 0
+    ok = fail = skipped = 0
+    total = len(pairs)
     for i, (src, dst) in enumerate(pairs, 1):
+        if i <= args.start:
+            skipped += 1
+            continue
         payload = build_check(src, dst)
-        status, text = create_check(auth, url, payload)
+        try:
+            status, text = create_check(auth, url, payload)
+        except Exception as e:
+            # All retries exhausted for this one check: record and keep going.
+            fail += 1
+            print(f"[{i}/{total}] FAIL (after retries) {payload['name']}\n        {type(e).__name__}: {e}")
+            continue
         if 200 <= status < 300:
             ok += 1
-            print(f"[{i}/{len(pairs)}] OK   {payload['name']}")
+            print(f"[{i}/{total}] OK   {payload['name']}")
         else:
             fail += 1
-            print(f"[{i}/{len(pairs)}] FAIL {status}  {payload['name']}\n        {text[:300]}")
+            print(f"[{i}/{total}] FAIL {status}  {payload['name']}\n        {text[:300]}")
 
     print("-" * 70)
-    print(f"Done. Created: {ok}   Failed: {fail}   Directory: /{DIRECTORY}")
+    print(f"Done. Created: {ok}   Failed: {fail}   Skipped: {skipped}   Directory: /{DIRECTORY}")
+    if fail:
+        print("Some checks failed. Fix the cause, then re-run with --start set past the last success "
+              "to avoid duplicates (async creation does not dedupe).")
 
 
 if __name__ == "__main__":
