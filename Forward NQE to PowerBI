@@ -1,0 +1,210 @@
+// Forward Networks NQE -> Power BI (Power Query M)
+// Paginated, snapshot-pinned, with error surfacing.
+// Verified against the Forward NQE OpenAPI spec v26.7:
+//   https://docs.fwd.app/latest/api/spec/nqe.json
+//
+// ---------------------------------------------------------------------------
+// SETUP
+// ---------------------------------------------------------------------------
+// 1. Fill in the parameters below.
+// 2. When Power BI prompts for credentials for this data source, choose ANONYMOUS.
+//    The Authorization header is built manually below because Power BI's native
+//    Basic auth does not apply to POST requests. This is deliberate and required.
+//    Do not remove the manual header. Under any credential type other than
+//    Anonymous, Power BI overrides the header and the request returns 401.
+// 3. To keep the secret key out of the .pbix, promote AccessKey / SecretKey to
+//    Power BI PARAMETERS. Parameters are safe. Do NOT source them from a lookup
+//    query, Excel sheet, CSV, or SQL table - feeding a value from one data source
+//    into a Web.Contents call to another is what trips Formula.Firewall, and the
+//    error will point at the paging loop rather than at the real cause.
+//
+// If Formula.Firewall does fire: Options -> Current File -> Privacy ->
+// Ignore Privacy Levels, or set the source's privacy level to Organizational.
+// Do not "fix" it by splitting the paging loop into separate queries - that
+// guarantees the error.
+//
+// NOTE ON RENAMING: M record fields are in scope as bare identifiers inside their
+// own record expression, so a field must never share a name (case included) with
+// the identifier on its right-hand side. Do not rename QueryId -> queryId,
+// NetworkId -> networkId, offsetValue -> offset, RequestTimeout -> Timeout, or
+// QueryParams -> Query. Each would become a cyclic reference error.
+// ---------------------------------------------------------------------------
+
+let
+    // ---------- Parameters ----------
+    // Literal, not derived from another query - the Power BI static analyzer
+    // requires a constant root URL. Self-hosted customers: use your own FQDN.
+    // If the Service or a gateway reports "data source not found", try inlining
+    // this string directly as the first argument to Web.Contents below.
+    BaseUrl   = "https://fwd.app",
+    NetworkId = "<insert_network_id_here>",
+    QueryId   = "<insert_nqe_query_id_here>",   // e.g. FQ_ac651cb2901b067fe7dbfb511613ab44776d8029
+
+    // API token = access key (username) + secret key (password).
+    // Both are required. The secret key is NOT blank.
+    AccessKey = "<insert_api_access_key_here>",
+    SecretKey = "<insert_api_secret_key_here>",
+
+    PageSize  = 10000,                          // 10000 is the documented API maximum
+    MaxPages  = 500,                            // hard stop, guards against a runaway loop
+    RequestTimeout = #duration(0, 0, 10, 0),    // default is 100s, too short for large NQE runs
+
+    // Optional. Fill in the NQE query's column names so the table keeps its shape
+    // on a refresh where the query legitimately returns zero rows (common and
+    // desirable for violation/compliance queries). Leave as null to accept a
+    // schema-less empty table.
+    ExpectedColumns = null,                     // e.g. {"deviceName", "interfaceName", "mtu"}
+
+    AuthHeader = "Basic " & Binary.ToText(
+        Text.ToBinary(AccessKey & ":" & SecretKey, TextEncoding.Utf8),
+        BinaryEncoding.Base64
+    ),
+
+    // ---------- Fetch one page ----------
+    // pinnedSnapshot is null for the first call (resolve the latest snapshot),
+    // then pinned for every subsequent page so all pages come from one snapshot.
+    GetPage = (offsetValue as number, pinnedSnapshot as nullable text) as record =>
+        let
+            Payload = [
+                queryId = QueryId,
+                queryOptions = [
+                    itemFormat = "JSON",
+                    limit      = PageSize,
+                    offset     = offsetValue
+                ]
+                // If the NQE query declares parameters, add them here, e.g.:
+                // , parameters = [ mtuThreshold = 1500 ]
+            ],
+
+            QueryParams =
+                if pinnedSnapshot = null
+                then [networkId = NetworkId]
+                else [snapshotId = pinnedSnapshot],
+
+            // BaseUrl / RelativePath / Query kept separate so Power BI's firewall
+            // permits the paging loop.
+            Response = Web.Contents(
+                BaseUrl,
+                [
+                    RelativePath = "api/nqe",
+                    Query        = QueryParams,
+                    Headers      = [
+                        #"Content-Type"  = "application/json",
+                        #"Accept"        = "application/json",
+                        #"Authorization" = AuthHeader
+                    ],
+                    Content              = Json.FromValue(Payload),
+                    Timeout              = RequestTimeout,
+                    // 502/504 included: common from a reverse proxy in front of a
+                    // self-hosted instance. Codes outside this list bypass the
+                    // handler below and throw natively.
+                    ManualStatusHandling = {400, 401, 403, 404, 405, 408, 409, 422, 429, 500, 502, 503, 504}
+                ]
+            ),
+
+            // Must be read from the raw Web.Contents result, before any transform.
+            Status = Record.FieldOrDefault(Value.Metadata(Response), "Response.Status", 200),
+
+            // Check status before parsing - a 401 or a proxy error may not be JSON.
+            // A 400 body carries `message` plus NQE parse diagnostics in `errors`.
+            Body =
+                if Status >= 200 and Status < 300 then
+                    Json.Document(Response)
+                else
+                    error Error.Record(
+                        "Forward NQE API error",
+                        "HTTP " & Text.From(Status) & " from " & BaseUrl & "/api/nqe",
+                        Text.FromBinary(Response, TextEncoding.Utf8)
+                    ),
+
+            ItemsRaw = Record.FieldOrDefault(Body, "items", {}),
+            Items    = if ItemsRaw = null then {} else ItemsRaw
+        in
+            [
+                Data     = Items,
+                Count    = List.Count(Items),
+                Total    = Record.FieldOrDefault(Body, "totalNumItems", null),
+                Snapshot = Record.FieldOrDefault(Body, "snapshotId", null)
+            ],
+
+    // ---------- First page: resolves and pins the snapshot ----------
+    FirstPage  = GetPage(0, null),
+    TotalItems = FirstPage[Total],
+
+    // Hard-fail rather than silently un-pin: if SnapshotId were null, every later
+    // page would fall back to networkId and re-resolve "latest snapshot", which is
+    // exactly the cross-snapshot tearing this design exists to prevent.
+    SnapshotId =
+        let s = FirstPage[Snapshot] in
+        if s = null then
+            error Error.Record(
+                "Forward NQE API error",
+                "Response did not include snapshotId, so pagination cannot be pinned to a single snapshot."
+            )
+        else s,
+
+    // ---------- Page until exhausted ----------
+    // Termination is on Count = 0 only. Deliberately NOT on "page shorter than
+    // PageSize": a page can come back short because of the API's 400MB page-size
+    // cap, not just at end-of-data, and stopping there would silently truncate.
+    // The offset therefore advances by rows ACTUALLY returned, not by PageSize.
+    // Cost of this choice is one extra request per refresh, which returns 0 rows.
+    // TotalItems is captured for reconciliation but is not used as a stop
+    // condition, so a change in its semantics cannot cause silent truncation.
+    AllPages = List.Generate(
+        () => [Offset = 0, PageNum = 1, Page = FirstPage],
+        each _ <> null,
+        each
+            if [Page][Count] = 0 or [PageNum] >= MaxPages then
+                null
+            else
+                let
+                    NextOffset = [Offset] + [Page][Count],
+                    NextPage   = GetPage(NextOffset, SnapshotId)
+                in
+                    [
+                        Offset  = NextOffset,
+                        PageNum = [PageNum] + 1,
+                        Page    = NextPage
+                    ],
+        each [Page][Data]
+    ),
+
+    // Materializes the whole result set in memory - a multi-million-row NQE query
+    // will be memory-bound here.
+    AllItems = List.Combine(AllPages),
+
+    // ---------- Shape into a table ----------
+    ToTable = Table.FromList(AllItems, Splitter.SplitByNothing(), null, null, ExtraValues.Error),
+
+    // NQE rows are uniform - the column set comes from the query's select clause,
+    // and null values are returned as explicit null properties rather than being
+    // omitted - so the first row's field names describe every row.
+    // If you ever hit a query where that does not hold, swap in the union-of-all-rows
+    // form instead (slower, scans every row):
+    //   List.Distinct(List.Combine(List.Transform(AllItems, Record.FieldNames)))
+    ColumnNames =
+        if not List.IsEmpty(AllItems) then Record.FieldNames(AllItems{0})
+        else if ExpectedColumns <> null then ExpectedColumns
+        else {},
+
+    Expanded =
+        if not List.IsEmpty(AllItems) then
+            Table.ExpandRecordColumn(ToTable, "Column1", ColumnNames)
+        else if not List.IsEmpty(ColumnNames) then
+            Table.FromRows({}, ColumnNames)
+        else
+            ToTable,
+
+    // Note: with itemFormat = "JSON", a list-valued NQE column arrives as an M list
+    // and will show as "List" here. Expand or transform those columns as needed.
+
+    // Provenance: which snapshot these numbers came from. Added even on a zero-row
+    // result so the schema does not shift between refreshes. Skipped only if the
+    // NQE query already emits a column of this name, since AddColumn would throw.
+    Result =
+        if Table.HasColumns(Expanded, "SnapshotId")
+        then Expanded
+        else Table.AddColumn(Expanded, "SnapshotId", each SnapshotId, type nullable text)
+in
+    Result
