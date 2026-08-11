@@ -85,6 +85,28 @@ MAX_ROWS_FOR_COLUMN_ANALYSIS = 2_000_000
 # (constant memory) but the magnitude is not reported.
 CARDINALITY_CAP = 50_000
 
+# ---------------------------------------------------------------------------
+# LOCAL DETAIL REPORT
+#
+# Everything printed to the screen is deliberately value-free so it can be shared.
+# That is not enough when you are validating a CORRECTNESS fix -- then you need to
+# see what the values actually became.
+#
+# Set a path here and the script writes a second file containing the actual
+# before -> after transitions, per column. That file holds RAW CELL VALUES: keep it
+# on this machine, and read it yourself rather than pasting it anywhere.
+#
+# Requires a working KEY_COLUMNS, since transitions are per paired row.
+# Leave "" to disable.
+LOCAL_DETAIL_FILE = ""          # e.g. r"detail_local_only.txt"
+
+# Per column, how many individual example transitions to list.
+LOCAL_DETAIL_MAX_SAMPLES = 25
+
+# Cap on rows held for the detail pass. Only CHANGED rows are held, so this is
+# normally far below the row count.
+LOCAL_DETAIL_MAX_ROWS = 200_000
+
 # Some NQE columns hold long list values, which exceed the csv module default.
 csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
 
@@ -200,6 +222,100 @@ def safe_value_counts(path, columns):
     return out
 
 
+def collect_changed_values(path, changed_keys, columns):
+    """Second pass: actual values, but only for rows whose key changed."""
+    gen = read_csv(path)
+    header, first = next(gen)
+    order = sorted(header)
+    key_idx = [order.index(c) for c in KEY_COLUMNS if c in order]
+    col_idx = {c: order.index(c) for c in columns if c in order}
+    out = {}
+
+    def handle(row):
+        if len(out) >= LOCAL_DETAIL_MAX_ROWS:
+            return
+        vals = canonical(header, row, order)
+        kh = _h("\x1f".join(vals[i] for i in key_idx))
+        if kh in changed_keys:
+            out[kh] = {c: vals[i] for c, i in col_idx.items()}
+
+    handle(first)
+    for _, row in gen:
+        handle(row)
+    return out
+
+
+def strip_common(old, new):
+    """Reduce a transition to just the part that differs.
+
+    "10.0.0.10/2" -> "10.0.0.10/24" becomes "" -> "4", so a column with thousands
+    of distinct transitions can still be summarised in one line.
+    """
+    i = 0
+    while i < min(len(old), len(new)) and old[i] == new[i]:
+        i += 1
+    j = 0
+    while (j < min(len(old), len(new)) - i
+           and old[len(old) - 1 - j] == new[len(new) - 1 - j]):
+        j += 1
+    return old[i:len(old) - j], new[i:len(new) - j]
+
+
+def write_local_detail(path, changed_by_col, before, after, order):
+    lines = []
+    w = lines.append
+    w("=" * 74)
+    w("NQE CSV regression diff -- LOCAL DETAIL REPORT")
+    w("=" * 74)
+    w("")
+    w("*** THIS FILE CONTAINS RAW CELL VALUES FROM YOUR EXPORTS. ***")
+    w("*** Keep it on this machine. Read it yourself; do not paste it. ***")
+    w("")
+    w(f"baseline : {BASELINE_CSV}")
+    w(f"candidate: {CANDIDATE_CSV}")
+    w(f"paired by: {KEY_COLUMNS}")
+    w("")
+
+    for col in order:
+        keys = changed_by_col.get(col)
+        if not keys:
+            continue
+        transitions = Counter()
+        shapes = Counter()
+        for kh in keys:
+            o = before.get(kh, {}).get(col)
+            n = after.get(kh, {}).get(col)
+            if o is None or n is None:
+                continue
+            transitions[(o, n)] += 1
+            shapes[strip_common(o, n)] += 1
+
+        w("-" * 74)
+        w(f"COLUMN: {col}")
+        w(f"  {len(keys):,} rows changed, {len(transitions):,} distinct transitions")
+        w("")
+
+        if shapes and len(shapes) < len(transitions):
+            w("  DIFFERING PART ONLY (common prefix/suffix stripped):")
+            for (o, n), cnt in shapes.most_common(12):
+                w(f"    {cnt:>10,}   {o!r:<28} ->  {n!r}")
+            if len(shapes) > 12:
+                w(f"    ... {len(shapes) - 12:,} more shapes")
+            w("")
+
+        w(f"  TRANSITIONS (top {min(LOCAL_DETAIL_MAX_SAMPLES, len(transitions))}"
+          f" of {len(transitions):,} by frequency):")
+        for (o, n), cnt in transitions.most_common(LOCAL_DETAIL_MAX_SAMPLES):
+            w(f"    {cnt:>10,}   {o!r:<40} ->  {n!r}")
+        if len(transitions) > LOCAL_DETAIL_MAX_SAMPLES:
+            w(f"    ... {len(transitions) - LOCAL_DETAIL_MAX_SAMPLES:,} more transitions")
+        w("")
+
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+    return len(lines)
+
+
 def main():
     print("=" * 74)
     print("NQE CSV regression diff")
@@ -304,6 +420,7 @@ def main():
 
         col_diffs = Counter()
         changed_rows = 0
+        changed_by_col = {}
         for kh in common:
             a, b = k1[kh], k2[kh]
             if a == b:
@@ -312,6 +429,7 @@ def main():
             for i, (x, y) in enumerate(zip(a, b)):
                 if x != y:
                     col_diffs[o1[i]] += 1
+                    changed_by_col.setdefault(o1[i], set()).add(kh)
 
         print()
         print("-" * 74)
@@ -332,6 +450,21 @@ def main():
         if len(k1) >= MAX_ROWS_FOR_COLUMN_ANALYSIS:
             print(f"\n  NOTE: capped at MAX_ROWS_FOR_COLUMN_ANALYSIS "
                   f"({MAX_ROWS_FOR_COLUMN_ANALYSIS:,}); this section is partial.")
+
+        if LOCAL_DETAIL_FILE and changed_by_col:
+            all_changed = set().union(*changed_by_col.values())
+            cols_changed = list(changed_by_col)
+            before = collect_changed_values(BASELINE_CSV, all_changed, cols_changed)
+            after = collect_changed_values(CANDIDATE_CSV, all_changed, cols_changed)
+            nlines = write_local_detail(LOCAL_DETAIL_FILE, changed_by_col,
+                                        before, after, o1)
+            print()
+            print(f"  Wrote the before -> after detail ({nlines:,} lines) to:")
+            print(f"    {LOCAL_DETAIL_FILE}")
+            print("  That file contains RAW CELL VALUES -- keep it on this machine.")
+        elif LOCAL_DETAIL_FILE:
+            print("\n  LOCAL_DETAIL_FILE is set but no paired row changed, so there")
+            print("  are no transitions to write.")
     elif not abandoned:
         print()
         print("-" * 74)
