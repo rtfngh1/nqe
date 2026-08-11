@@ -75,10 +75,15 @@ KEY_COLUMNS = ["_id"]
 # MAC addresses, serial numbers or any composite key built from them.
 SAFE_BREAKDOWN_COLUMNS = []
 
-# The per-column analysis holds one entry per row in memory. At around a million
-# rows expect a few hundred MB. Lower this to cap memory; the multiset counts in
-# section 1 are unaffected and always cover the whole file.
+# The KEY_COLUMNS pairing holds one entry per row in memory. At around a million
+# rows expect a few hundred MB. Lower this to cap memory; sections 1 and 2 are
+# unaffected and always cover the whole file.
 MAX_ROWS_FOR_COLUMN_ANALYSIS = 2_000_000
+
+# Section 2 tracks an exact per-column change magnitude for columns with fewer
+# distinct values than this. Above it, the column is still checked for change
+# (constant memory) but the magnitude is not reported.
+CARDINALITY_CAP = 50_000
 
 # Some NQE columns hold long list values, which exceed the csv module default.
 csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
@@ -117,7 +122,15 @@ def canonical(header, row, order):
 
 
 def scan(path):
-    """Return (header, column_order, row_hash_multiset, {key_hash: col_hashes}, n)."""
+    """One pass. Returns everything the report needs.
+
+    Per column we keep an order-independent fingerprint (count, sum of value
+    hashes, xor of value hashes) which detects any change in that column's value
+    multiset using constant memory. We ALSO keep a full value-hash Counter, but
+    only while the column stays under CARDINALITY_CAP distinct values -- that
+    gives an exact magnitude for enum-like columns without blowing memory on
+    high-cardinality ones.
+    """
     gen = read_csv(path)
     header, first = next(gen)
     order = sorted(header)
@@ -125,12 +138,28 @@ def scan(path):
 
     multiset = Counter()
     per_key = {}
+    col_sum = [0] * len(order)
+    col_xor = [0] * len(order)
+    col_counter = [Counter() for _ in order]
+    col_overflow = [False] * len(order)
     n = 0
+    MASK = (1 << 64) - 1
 
     def handle(row):
         nonlocal n
         vals = canonical(header, row, order)
         multiset[_h("\x1f".join(vals))] += 1
+        for i, v in enumerate(vals):
+            hv = _h(v)
+            col_sum[i] = (col_sum[i] + hv) & MASK
+            col_xor[i] ^= hv
+            if not col_overflow[i]:
+                c = col_counter[i]
+                if hv in c or len(c) < CARDINALITY_CAP:
+                    c[hv] += 1
+                else:
+                    col_overflow[i] = True
+                    c.clear()
         if key_idx and n < MAX_ROWS_FOR_COLUMN_ANALYSIS:
             per_key[_h("\x1f".join(vals[i] for i in key_idx))] = tuple(
                 _h(v) for v in vals
@@ -140,7 +169,16 @@ def scan(path):
     handle(first)
     for _, row in gen:
         handle(row)
-    return header, order, multiset, per_key, n
+
+    cols = {
+        order[i]: {
+            "sum": col_sum[i],
+            "xor": col_xor[i],
+            "counter": None if col_overflow[i] else col_counter[i],
+        }
+        for i in range(len(order))
+    }
+    return header, order, multiset, per_key, n, cols
 
 
 def safe_value_counts(path, columns):
@@ -167,8 +205,8 @@ def main():
     print(f"baseline : {BASELINE_CSV}")
     print(f"candidate: {CANDIDATE_CSV}\n")
 
-    h1, o1, m1, k1, n1 = scan(BASELINE_CSV)
-    h2, o2, m2, k2, n2 = scan(CANDIDATE_CSV)
+    h1, o1, m1, k1, n1, c1 = scan(BASELINE_CSV)
+    h2, o2, m2, k2, n2, c2 = scan(CANDIDATE_CSV)
 
     if o1 != o2:
         print("COLUMN SET DIFFERS -- everything below is unreliable until this is fixed")
@@ -199,6 +237,39 @@ def main():
     if n_removed == 0 and n_added == 0:
         print("\n  >>> EXPORTS ARE EQUIVALENT (same rows, any order) <<<")
 
+    # --- section 2: which COLUMNS changed, no key required -----------------
+    print()
+    print("-" * 74)
+    print("2. WHICH COLUMNS CHANGED (needs no key -- always reliable)")
+    print("-" * 74)
+    changed_cols, unchanged_cols = [], []
+    for col in o1:
+        a, b = c1[col], c2[col]
+        same = a["sum"] == b["sum"] and a["xor"] == b["xor"]
+        if same:
+            unchanged_cols.append(col)
+            continue
+        if a["counter"] is not None and b["counter"] is not None:
+            moved = sum((a["counter"] - b["counter"]).values())
+            gained = sum((b["counter"] - a["counter"]).values())
+            changed_cols.append((col, moved, gained))
+        else:
+            changed_cols.append((col, None, None))
+
+    if not changed_cols:
+        print("  every column has an identical value multiset -- nothing moved")
+    else:
+        width = max(len(c) for c, _, _ in changed_cols)
+        print(f"  {len(changed_cols)} column(s) changed, {len(unchanged_cols)} unchanged\n")
+        print(f"    {'column':<{width}}  {'left baseline':>14}{'entered candidate':>19}")
+        for col, moved, gained in changed_cols:
+            if moved is None:
+                print(f"    {col:<{width}}  {'CHANGED':>14}{'(high cardinality)':>19}")
+            else:
+                print(f"    {col:<{width}}  {moved:>14,}{gained:>19,}")
+        if unchanged_cols:
+            print(f"\n  unchanged: {', '.join(unchanged_cols)}")
+
     if k1 and k2:
         common = k1.keys() & k2.keys()
         gone = len(k1.keys() - k2.keys())
@@ -217,7 +288,7 @@ def main():
 
         print()
         print("-" * 74)
-        print(f"2. PAIRED BY {KEY_COLUMNS} (key values hashed, never printed)")
+        print(f"3. PAIRED BY {KEY_COLUMNS} (key values hashed, never printed)")
         print("-" * 74)
         print(f"  keys in both          : {len(common):,}")
         print(f"  keys only in baseline : {gone:,}   (rows that DISAPPEARED)")
@@ -234,14 +305,45 @@ def main():
         if len(k1) >= MAX_ROWS_FOR_COLUMN_ANALYSIS:
             print(f"\n  NOTE: capped at MAX_ROWS_FOR_COLUMN_ANALYSIS "
                   f"({MAX_ROWS_FOR_COLUMN_ANALYSIS:,}); this section is partial.")
-    elif KEY_COLUMNS:
-        print(f"\n  (section 2 skipped: none of {KEY_COLUMNS} are columns in these files)")
+    else:
+        print()
+        print("-" * 74)
+        print("3. PAIRING SKIPPED")
+        print("-" * 74)
+        if not KEY_COLUMNS:
+            print("  KEY_COLUMNS is empty.")
+        else:
+            missing = [c for c in KEY_COLUMNS if c not in o1]
+            print(f"  KEY_COLUMNS {missing} are not columns in these files.")
+        # Suggest usable keys. A key column must be unique per row AND stable --
+        # a column that changed in this very edit is useless as a key, because its
+        # rows show up as one removal plus one addition.
+        moved_names = {c for c, _, _ in changed_cols}
+        unique = [c for c in o1
+                  if c1[c]["counter"] is not None and len(c1[c]["counter"]) == n1]
+        stable = [c for c in unique if c not in moved_names]
+        if stable:
+            print(f"\n  Unique per row AND unchanged by this edit -- use one of these:")
+            print(f"    {stable}")
+            rejected = [c for c in unique if c in moved_names]
+            if rejected:
+                print(f"  (also unique but they CHANGED, so useless as a key: {rejected})")
+        elif unique:
+            print(f"\n  The only unique columns are ones this edit changed ({unique}),")
+            print("  so pairing cannot work for this comparison. Section 2 is the")
+            print("  answer here -- it needs no key.")
+        else:
+            print("\n  No single column is unique per row, so pairing needs a composite")
+            print("  key. Pick columns that identify a row but CANNOT change in the")
+            print("  edit you are testing -- if a key column changes, its rows appear")
+            print("  as one removal plus one addition and section 3 tells you nothing.")
+            print("  Section 2 above does not have this problem.")
 
     cols = [c for c in SAFE_BREAKDOWN_COLUMNS if c in o1]
     if cols:
         print()
         print("-" * 74)
-        print("3. VALUE BREAKDOWN for the columns you nominated as printable")
+        print("4. VALUE BREAKDOWN for the columns you nominated as printable")
         print("-" * 74)
         b1 = safe_value_counts(BASELINE_CSV, cols)
         b2 = safe_value_counts(CANDIDATE_CSV, cols)
