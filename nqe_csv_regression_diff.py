@@ -138,6 +138,7 @@ def scan(path):
 
     multiset = Counter()
     per_key = {}
+    key_counts = Counter()
     col_sum = [0] * len(order)
     col_xor = [0] * len(order)
     col_counter = [Counter() for _ in order]
@@ -161,9 +162,9 @@ def scan(path):
                     col_overflow[i] = True
                     c.clear()
         if key_idx and n < MAX_ROWS_FOR_COLUMN_ANALYSIS:
-            per_key[_h("\x1f".join(vals[i] for i in key_idx))] = tuple(
-                _h(v) for v in vals
-            )
+            kh = _h("\x1f".join(vals[i] for i in key_idx))
+            key_counts[kh] += 1
+            per_key[kh] = tuple(_h(v) for v in vals)
         n += 1
 
     handle(first)
@@ -178,7 +179,8 @@ def scan(path):
         }
         for i in range(len(order))
     }
-    return header, order, multiset, per_key, n, cols
+    dup_keys = sum(c - 1 for c in key_counts.values() if c > 1)
+    return header, order, multiset, per_key, n, cols, dup_keys
 
 
 def safe_value_counts(path, columns):
@@ -205,8 +207,8 @@ def main():
     print(f"baseline : {BASELINE_CSV}")
     print(f"candidate: {CANDIDATE_CSV}\n")
 
-    h1, o1, m1, k1, n1, c1 = scan(BASELINE_CSV)
-    h2, o2, m2, k2, n2, c2 = scan(CANDIDATE_CSV)
+    h1, o1, m1, k1, n1, c1, d1 = scan(BASELINE_CSV)
+    h2, o2, m2, k2, n2, c2, d2 = scan(CANDIDATE_CSV)
 
     if o1 != o2:
         print("COLUMN SET DIFFERS -- everything below is unreliable until this is fixed")
@@ -270,6 +272,31 @@ def main():
         if unchanged_cols:
             print(f"\n  unchanged: {', '.join(unchanged_cols)}")
 
+    # A non-unique key makes pairing meaningless: rows sharing a key collapse into
+    # one entry and the per-column counts silently undercount. Refuse rather than
+    # report a wrong number.
+    if (d1 or d2) and k1 and k2:
+        print()
+        print("-" * 74)
+        print("3. PAIRING ABANDONED -- KEY IS NOT UNIQUE")
+        print("-" * 74)
+        print(f"  KEY_COLUMNS {KEY_COLUMNS} repeat: {d1:,} duplicate rows in the")
+        print(f"  baseline and {d2:,} in the candidate.")
+        print("\n  Rows sharing a key cannot be paired, so any per-column count would")
+        print("  be wrong. Section 2 above is unaffected and needs no key.")
+        stable = [c for c in o1
+                  if c1[c]["counter"] is not None and len(c1[c]["counter"]) == n1
+                  and c not in {cc for cc, _, _ in changed_cols}]
+        if stable:
+            print(f"\n  Unique and unchanged, so usable as a key: {stable}")
+        else:
+            print("\n  No single column is unique. Add another column to KEY_COLUMNS --")
+            print("  a composite key is normal here (e.g. source + interface + address).")
+        k1 = k2 = None
+        abandoned = True
+    else:
+        abandoned = False
+
     if k1 and k2:
         common = k1.keys() & k2.keys()
         gone = len(k1.keys() - k2.keys())
@@ -305,7 +332,7 @@ def main():
         if len(k1) >= MAX_ROWS_FOR_COLUMN_ANALYSIS:
             print(f"\n  NOTE: capped at MAX_ROWS_FOR_COLUMN_ANALYSIS "
                   f"({MAX_ROWS_FOR_COLUMN_ANALYSIS:,}); this section is partial.")
-    else:
+    elif not abandoned:
         print()
         print("-" * 74)
         print("3. PAIRING SKIPPED")
